@@ -99,7 +99,7 @@ class SSDModel:
             self.bbox_names = [bbox.name for bbox in self.model.layers if bbox.name.endswith('bbox')]
             self.cls_names = [bbox.name for bbox in self.model.layers if bbox.name.endswith('class')]
 
-        self.num_poolings = 5
+        self.num_poolings = 6
         # Here we assume that it's possible to detect barcode from 64x64 image.
         self.window_size = 1 << self.num_poolings
 

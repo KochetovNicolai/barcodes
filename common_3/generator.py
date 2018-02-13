@@ -11,15 +11,62 @@ from keras.preprocessing import image
 from keras.applications.vgg16 import preprocess_input
 
 
+class NPArrayCache:
+
+    class Cell:
+        def __init__(self, arr, time):
+            self.arr = arr
+            self.time = time
+
+    def __init__(self, mem_limit_bytes):
+        self.cache = {}
+        self.tot_bytes = 0
+        self.lre_queue = []
+        self.time = 0
+        self.mem_limit_bytes = mem_limit_bytes
+
+    def get(self, name):
+        if name not in self.cache:
+            return None
+
+        self.cache[name].time = self.time
+        self.lre_queue.append((name, self.time))
+        self.time += 1
+        return self.cache[name].arr
+
+    def set(self, name, arr):
+        self.cache[name] = NPArrayCache.Cell(arr, self.time)
+        self.lre_queue.append((name, self.time))
+        self.time += 1
+        self.tot_bytes += arr.nbytes
+        self.clean()
+
+    def clean(self):
+        if self.tot_bytes < self.mem_limit_bytes:
+            return
+
+        while self.tot_bytes > self.mem_limit_bytes and len(self.lre_queue):
+            name, time = self.lre_queue[0]
+            self.lre_queue = self.lre_queue[1:]
+            if time == self.cache[name].time:
+                self.tot_bytes -= self.cache[name].arr.nbytes
+                del self.cache[name]
+
+        if self.tot_bytes > self.mem_limit_bytes:
+            raise Exception("Logical error: queue is empty, but tot_bytes > mem_limit_bytes ({} > {}), cache_size = {}"
+                            .format(self.tot_bytes, self.mem_limit_bytes, len(self.cache)))
+
+
 class Generator:
 
-    def __init__(self, root, model):
+    def __init__(self, root, model, cache_mem_limit_bytes=1 << 30):
         if not isinstance(model, SSDModel):
             raise Exception('expected SSDModel')
         self.root = root
         self.model = model
         self.max_ratio = model.max_ratio
         self.num_poolings = model.num_poolings
+        self.cache = NPArrayCache(cache_mem_limit_bytes)
 
     def _get_possible_windows(self, h, w):
         mn = min(h, w)
@@ -96,8 +143,8 @@ class Generator:
                         # img coord
                         i = wrect.intersection(rect)
                         qual_out = i.area() / float(wrect.area())
-                        if qual_out <= 0:
-                            print rect ,wrect, i
+                        # if qual_out <= 0:
+                        #     print rect ,wrect, i
                         # window coord
                         i.move(-wrect.top, -wrect.left)
                         # window 0..1 coord
@@ -186,46 +233,41 @@ class Generator:
 
                     cnt *= 2
 
-    def _get_processed_batches(self, annos, processed_data, batch_size):
+    def _get_processed_batches(self, annos, processed_data, max_batch_size_for_smallest_image):
+
+        smallest_image_size = 1 << self.num_poolings
+
         for anno in annos:
             self._process_anno(anno, processed_data)
 
-            if True:
+            if False:
                 for key, value in processed_data.items():
                     print key, ':', len(value)
 
             for key in processed_data.keys():
                 val = processed_data[key]
+
+                divisor = key * key
+
+                if divisor > max_batch_size_for_smallest_image:
+                    # not enough memory for subimage
+                    processed_data[key] = []
+                    continue
+
+                batch_size = int(max_batch_size_for_smallest_image / divisor)
+
                 while len(val) >= batch_size:
                     yield key, val[:batch_size]
                     val = val[batch_size:]
 
                 processed_data[key] = val
 
-                if True:
+                if False:
                     for key2, value2 in processed_data.items():
                         print key2, ':', len(value2)
 
-    def _gen_tensors(self, size, processed_tensors):
-        batch_size = len(processed_tensors)
 
-        # input tensor
-        inputs = []
-        for info in processed_tensors:
-            window = info['window']
-            img_size = size << self.num_poolings
-
-            img = image.img_to_array(image.load_img(os.path.join(self.root, info['path'])))
-            img = img[window.top:window.bottom, window.left:window.right, :]
-            z = np.zeros((window.height(), window.width(), 3), dtype=float)
-            grid = np.meshgrid(np.arange(img.shape[0]), np.arange(img.shape[1]))
-            z[grid] = img[grid]
-            img = z
-
-            img = skimage.transform.resize(img, (img_size, img_size), mode='reflect')
-            inputs.append(img)
-        inputs = preprocess_input(np.array(inputs))
-
+    def _fill_bboxes(self, size, batch_size, processed_tensors):
         # output_tensors
         bbox_size = 2 * size - 1
         cls = np.zeros((batch_size, bbox_size, bbox_size, 1))
@@ -247,12 +289,47 @@ class Generator:
                     bottom[ind, y, x, 0] = b
                     qual[ind, y, x, 0] = q
 
+        return cls, left, top, right, bottom
+
+    def test_copy(self, z, img, h, w):
+        z[:h, :w, :] = img[:h, :w, :]
+
+    def _gen_tensors(self, size, processed_tensors):
+        batch_size = len(processed_tensors)
+
+        # input tensor
+        inputs = []
+        for info in processed_tensors:
+            window = info['window']
+            img_size = size << self.num_poolings
+
+            path = os.path.join(self.root, info['path'])
+            img = self.cache.get(path)
+            if img is None:
+                img = image.img_to_array(image.load_img(path))
+                self.cache.set(path, img)
+
+            img = img[window.top:window.bottom, window.left:window.right, :]
+            z = np.zeros((window.height(), window.width(), 3), dtype=float)
+            self.test_copy(z, img, img.shape[0], img.shape[1])
+            img = z
+
+            img = skimage.transform.resize(img, (img_size, img_size), mode='reflect')
+            inputs.append(img)
+        inputs = preprocess_input(np.array(inputs))
+
+        cls, left, top, right, bottom = self._fill_bboxes(size, batch_size, processed_tensors)
+
         return inputs, cls, left, top, right, bottom
 
-    def generate(self, annos, batch_size, verbose=False):
+    def generate(self, annos, max_batch_size_for_smallest_image, verbose=False):
         processed_data = {}
+
+        def wrap(bbox, cls):
+            return np.concatenate((bbox, cls), axis=-1)
+
         while True:
-            batcher = self._get_processed_batches(annos, processed_data, batch_size)
+            batcher = self._get_processed_batches(annos, processed_data, max_batch_size_for_smallest_image)
             for size, processed_tensors in batcher:
                 if verbose:
                     print 'next batch:'
@@ -262,13 +339,12 @@ class Generator:
                         print 'tensors:', info['tensors']
 
                 inputs, cls, left, top, right, bottom = self._gen_tensors(size, processed_tensors)
-                yield {
-                    'input': inputs,
+                yield {'input': inputs}, {
                     'block4_class': cls,
-                    'dleft_block4_bbox': left,
-                    'dtop_block4_bbox': top,
-                    'dright_block4_bbox': right,
-                    'dbottom_block4_bbox': bottom
+                    'dleft_block4_bbox': wrap(left, cls),
+                    'dtop_block4_bbox': wrap(top, cls),
+                    'dright_block4_bbox': wrap(right, cls),
+                    'dbottom_block4_bbox': wrap(bottom, cls)
                 }
 
 
@@ -291,8 +367,8 @@ if __name__ == '__main__':
     ssd_model = SSDModel(do_not_load=True)
 
     ssd_generator = Generator(ROOT, ssd_model)
-    gen = ssd_generator.generate(anno[:], 1, True)
+    gen = ssd_generator.generate(anno[:], 32, False)
     for i, t in enumerate(gen):
-        print i, t
+        # print i, t
         if i > 100:
             break
