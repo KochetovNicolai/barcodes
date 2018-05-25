@@ -8,21 +8,36 @@ import json
 
 
 class Converter:
-    def __init__(self, model):
+    def __init__(self, model, verbose=False):
 
         if not isinstance(model, SSDModel):
             raise Exception("ssd model expected")
 
         self.model = model
+        self.verbose = verbose
 
-    def _restore_rects(self, dleft, dtop, dright, dbottom, cls, num_poolings, threshold=None, top=None):
+    def _restore_rects(self, lr, tb, cls, num_poolings, threshold=None, top=None):
         # print ratio
-        map_h, map_w = cls.shape[1:3]
-        cnt_h = (map_h + 1) / 2
-        cnt_w = (map_w + 1) / 2
-        print map_h, map_w
-        print cnt_h, cnt_w
-        print cls.shape
+        map_h, map_w = lr.shape[1:3]
+        if self.verbose:
+            print map_h, map_w
+            if cls is not None:
+                print cls.shape
+
+        left_logit = lr[:,:,:,0]
+        right_logit = lr[:,:,:,1]
+        top_logit = tb[:,:,:,0]
+        bottom_logit = tb[:,:,:,1]
+
+        if cls is not None:
+            bg_logit = np.exp(cls[:,:,:,0])
+            bar_logit = np.exp(cls[:,:,:,1])
+            prob = np.exp(bar_logit) / (np.exp(bar_logit) + np.exp(bg_logit))
+
+        dleft = left_logit
+        dright = 1.0 - right_logit
+        dtop = top_logit
+        dbottom = 1.0 - bottom_logit
 
         def cut_top(res):
             res = sorted(res, reverse=True, key=lambda val: val[0])
@@ -35,22 +50,24 @@ class Converter:
         for y in range(0, map_h):
             for x in range(0, map_w):
 
-                # print tdy.shape
-                dl, dr, dt, db = dleft[0, y, x, 0], dright[0, y, x, 0], dtop[0, y, x, 0], dbottom[0, y, x, 0]
+                dl, dr, dt, db = dleft[0, y, x], dright[0, y, x], dtop[0, y, x], dbottom[0, y, x]
 
                 #dy, dx, sh, sw = 0,0,0,0
                 #sh, sw = 0, 0
                 #dy, dx = 0, 0
 
                 # print cls.shape
-                conf = cls[0, y, x, 0]
-                if conf > 0:
+                conf = prob[0, y, x] if cls is not None else 0
+
+                if self.verbose and conf > 0:
                     print conf, y, x, dl, dr, dt, db
                 if threshold is not None or conf > threshold:
                     rect = Rect(x + dl * 2, y + dt * 2, x + dr * 2, y + db * 2)
-                    print rect
                     rect.stretch(1 << (num_poolings), 1 << (num_poolings))
-                    print rect
+
+                    if self.verbose:
+                        print rect
+
                     res.append((conf, rect))
 
                     if top is not None and len(res) > 2 * top:
@@ -69,10 +86,11 @@ class Converter:
                 res = res[:top]
             return res
 
-        dleft, dtop, dright, dbottom, cls = tensors
+        lr, tb, cls = tensors
 
-        result = self._restore_rects(dleft, dtop, dright, dbottom, cls, self.model.num_poolings, threshold, top)
-        print result
+        result = self._restore_rects(lr, tb, cls, self.model.num_poolings, threshold, top)
+        if self.verbose:
+            print result
 
         result = cut_top(result)
         return tuple(r[0] for r in result), tuple(r[1] for r in result)

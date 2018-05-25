@@ -69,6 +69,12 @@ class Rect:
         self.stretch_h(scale_h)
         self.stretch_w(scale_w)
 
+    def integerify(self):
+        self.top = int(self.top)
+        self.bottom = int(self.bottom)
+        self.left = int(self.left)
+        self.right = int(self.right)
+
     def height(self):
         return self.bottom - self.top
 
